@@ -1,0 +1,644 @@
+---
+title: "Model-Based Clustering — Cancer Risk Lifestyle Data"
+subtitle: "CRISP-DM: Data Understanding → Preparation → Modelling → Evaluation"
+author: "Jessica Ngobeni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# 1. Project overview
+
+This analysis uses **model-based clustering (`mclust`)** to identify lifestyle
+and nutrition subgroups in the cancer-risk dataset.
+
+A key methodological improvement in this version is that **Lifestyle is not
+one-hot encoded and fed into a Gaussian mixture model**. `mclust` assumes
+continuous variables, so using 0/1 dummy variables as if they were continuous
+can artificially inflate distance-based diagnostics such as the Hopkins
+statistic.
+
+The clustering model therefore uses only the continuous lifestyle/nutrition
+measurements:
+
+- BMI
+- Carbohydrates
+- Proteins
+- Fats
+- Vitamin A
+- Vitamin C
+- Iron
+
+`Lifestyle` is retained for **cluster interpretation**, not as a clustering
+input.
+
+# 2. Load packages
+
+```{r libraries}
+required_packages <- c(
+  "mclust",
+  "cluster",
+  "ggplot2",
+  "tidyr",
+  "dplyr",
+  "corrplot",
+  "factoextra",
+  "scales"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Missing package(s): ", paste(missing_packages, collapse = ", "),
+      ". Install them once with:\ninstall.packages(c(",
+      paste0('"', missing_packages, '"', collapse = ", "),
+      "))"
+    )
+  )
+}
+
+library(mclust)
+library(cluster)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(corrplot)
+library(factoextra)
+library(scales)
+```
+
+# 3. Load the data
+
+The project dataset is a CSV file. The code deliberately checks that the file
+exists before trying to read it.
+
+```{r load-data}
+data_file <- "crc_data_with_clusters.csv"
+
+if (!file.exists(data_file)) {
+  stop(
+    paste0(
+      "Cannot find '", data_file, "'. ",
+      "Place the CSV file in the same folder as this Rmd and knit again."
+    )
+  )
+}
+
+df <- read.csv(data_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+cat("Rows:", nrow(df), "\n")
+cat("Columns:", ncol(df), "\n")
+head(df)
+```
+
+## 3.1 Check the structure
+
+```{r structure}
+str(df)
+```
+
+# 4. Data quality and exploratory analysis
+
+## 4.1 Required columns
+
+```{r required-columns}
+required_columns <- c(
+  "Participant_ID", "Age", "Gender", "BMI", "Lifestyle",
+  "Ethnicity", "Family_History_CRC", "Pre-existing Conditions",
+  "Carbohydrates (g)", "Proteins (g)", "Fats (g)",
+  "Vitamin A (IU)", "Vitamin C (mg)", "Iron (mg)", "CRC_Risk"
+)
+
+missing_required <- setdiff(required_columns, names(df))
+
+if (length(missing_required) > 0) {
+  stop(
+    paste("The following required columns are missing:",
+          paste(missing_required, collapse = ", "))
+  )
+}
+
+cat("All required columns are present.\n")
+```
+
+## 4.2 Remove any old cluster column
+
+The supplied CSV may already contain a `Cluster` column from an earlier run.
+It must **not** be used as an input when creating a new clustering solution.
+
+```{r remove-old-cluster}
+if ("Cluster" %in% names(df)) {
+  df$Cluster <- NULL
+  cat("Old Cluster column removed before reclustering.\n")
+} else {
+  cat("No previous Cluster column found.\n")
+}
+```
+
+## 4.3 Fix numeric types
+
+```{r numeric-types}
+numeric_features <- c(
+  "BMI",
+  "Carbohydrates (g)",
+  "Proteins (g)",
+  "Fats (g)",
+  "Vitamin A (IU)",
+  "Vitamin C (mg)",
+  "Iron (mg)"
+)
+
+for (v in numeric_features) {
+  df[[v]] <- as.numeric(df[[v]])
+}
+
+numeric_check <- sapply(df[numeric_features], is.numeric)
+print(numeric_check)
+```
+
+## 4.4 Missing-value check
+
+```{r missing-values}
+missing_summary <- data.frame(
+  Variable = names(df),
+  Missing = sapply(df, function(x) sum(is.na(x))),
+  Percent = round(
+    100 * sapply(df, function(x) sum(is.na(x))) / nrow(df), 2
+  )
+)
+
+print(missing_summary[order(-missing_summary$Missing), ])
+```
+
+For the clustering variables, missing numeric values are replaced by the
+**median of that variable**. This keeps the clustering sample size intact and
+is less sensitive to extreme values than mean imputation.
+
+```{r impute-clustering}
+for (v in numeric_features) {
+  if (anyNA(df[[v]])) {
+    df[[v]][is.na(df[[v]])] <- median(df[[v]], na.rm = TRUE)
+  }
+}
+
+cat("Missing values in clustering variables after imputation:",
+    sum(is.na(df[numeric_features])), "\n")
+```
+
+## 4.5 Numeric distributions
+
+```{r distributions}
+eda_long <- pivot_longer(
+  df[, numeric_features, drop = FALSE],
+  cols = everything(),
+  names_to = "Feature",
+  values_to = "Value"
+)
+
+ggplot(eda_long, aes(x = Value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ Feature, scales = "free", ncol = 3) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Distribution of continuous clustering variables",
+    x = NULL,
+    y = "Count"
+  )
+```
+
+## 4.6 Correlation matrix
+
+```{r correlation}
+cor_matrix <- cor(df[numeric_features], use = "pairwise.complete.obs")
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  number.cex = 0.7,
+  tl.col = "black",
+  tl.srt = 45,
+  diag = FALSE
+)
+```
+
+# 5. Prepare the clustering data
+
+## 5.1 Select continuous clustering variables
+
+```{r select-clustering}
+cluster_data <- df[, numeric_features, drop = FALSE]
+
+summary(cluster_data)
+```
+
+## 5.2 Standardise the variables
+
+Standardisation prevents variables with larger numerical units, especially
+Vitamin A, from dominating the model.
+
+```{r scale-data}
+cluster_scaled <- scale(cluster_data)
+
+cat("Clustering observations:", nrow(cluster_scaled), "\n")
+cat("Clustering variables:", ncol(cluster_scaled), "\n")
+```
+
+# 6. Hopkins statistic — clustering tendency
+
+The **Hopkins statistic is a diagnostic**, not proof that clusters exist.
+
+A value around 0.5 is broadly consistent with a random spatial pattern, while
+values substantially above 0.5 indicate increasing evidence of non-random
+structure. Values extremely close to 1 should be treated cautiously.
+
+Most importantly, this analysis calculates Hopkins **only on continuous
+variables**. This avoids the 0/1 dummy-variable problem that can produce an
+artificially high value such as 0.998.
+
+```{r hopkins}
+set.seed(42)
+
+hopkins_result <- factoextra::get_clust_tendency(
+  cluster_scaled,
+  n = min(200, nrow(cluster_scaled)),
+  graph = FALSE
+)
+
+hopkins_value <- hopkins_result$hopkins_stat
+
+cat("Continuous-only Hopkins statistic:",
+    round(hopkins_value, 4), "\n")
+
+if (hopkins_value > 0.95) {
+  cat(
+    "Interpretation: very strong clustering tendency detected. ",
+    "This should still be checked against BIC, silhouette and the ",
+    "dissimilarity matrix rather than treated as proof of well-separated clusters.\n"
+  )
+} else if (hopkins_value > 0.75) {
+  cat("Interpretation: substantial evidence of non-random structure.\n")
+} else if (hopkins_value > 0.60) {
+  cat("Interpretation: some evidence of clusterable structure.\n")
+} else {
+  cat("Interpretation: weak evidence of strong cluster structure.\n")
+}
+```
+
+# 7. Dissimilarity matrix
+
+The full 1,000 × 1,000 matrix is unnecessarily large to display. A random
+sample of at most 200 observations is used for a readable and reproducible
+heatmap.
+
+The observations are ordered by their eventual cluster assignment so that
+possible within-cluster blocks can be seen clearly.
+
+```{r matrix-sample}
+set.seed(42)
+
+matrix_n <- min(200, nrow(cluster_scaled))
+matrix_rows <- sample(seq_len(nrow(cluster_scaled)), matrix_n)
+
+matrix_data <- cluster_scaled[matrix_rows, , drop = FALSE]
+
+cat("Observations displayed in dissimilarity matrix:", matrix_n, "\n")
+```
+
+The first matrix is shown **before clustering** so that the distance structure
+is not visually forced into clusters.
+
+```{r raw-dissimilarity, fig.width=7, fig.height=6}
+raw_dist <- as.matrix(dist(matrix_data))
+
+image(
+  1:nrow(raw_dist),
+  1:ncol(raw_dist),
+  raw_dist,
+  col = hcl.colors(100, "YlOrRd", rev = TRUE),
+  axes = FALSE,
+  xlab = "Sampled observations",
+  ylab = "Sampled observations",
+  main = "Dissimilarity matrix — continuous variables"
+)
+
+axis(1, at = pretty(seq_len(nrow(raw_dist))))
+axis(2, at = pretty(seq_len(nrow(raw_dist))))
+box()
+```
+
+# 8. Model-based clustering with Mclust
+
+Several possible numbers of clusters are evaluated. BIC is used to select the
+best-supported Gaussian mixture model.
+
+```{r mclust}
+set.seed(42)
+
+mclust_model <- Mclust(
+  cluster_scaled,
+  G = 2:8
+)
+
+summary(mclust_model)
+```
+
+## 8.1 BIC model selection
+
+```{r bic, fig.width=8, fig.height=6}
+plot(
+  mclust_model,
+  what = "BIC",
+  main = "BIC comparison across candidate cluster solutions"
+)
+```
+
+```{r optimal-clusters}
+optimal_G <- mclust_model$G
+
+cat("BIC-selected number of clusters:", optimal_G, "\n")
+cat("Selected covariance model:", mclust_model$modelName, "\n")
+```
+
+## 8.2 Attach cluster membership
+
+```{r attach-clusters}
+df$Cluster <- factor(mclust_model$classification)
+
+cluster_sizes <- as.data.frame(table(df$Cluster))
+names(cluster_sizes) <- c("Cluster", "Count")
+
+print(cluster_sizes)
+
+ggplot(cluster_sizes, aes(x = Cluster, y = Count)) +
+  geom_col() +
+  geom_text(aes(label = Count), vjust = -0.3) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Number of observations in each cluster",
+    x = "Cluster",
+    y = "Observations"
+  )
+```
+
+# 9. PCA visualisation
+
+PCA is used only as a **visualisation tool**. The actual clustering model is
+still the Mclust model above.
+
+```{r pca}
+pca <- prcomp(cluster_scaled, center = FALSE, scale. = FALSE)
+
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Cluster = df$Cluster
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, shape = Cluster)) +
+  geom_point(alpha = 0.75, size = 2) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Mclust clusters projected onto the first two principal components",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    shape = "Cluster"
+  )
+```
+
+# 10. Cluster-ordered dissimilarity matrix
+
+Now the same sampled observations are ordered by the Mclust cluster
+assignment. Clear diagonal blocks indicate stronger within-cluster similarity;
+blurred boundaries indicate overlap.
+
+```{r ordered-matrix, fig.width=7, fig.height=6}
+sample_clusters <- df$Cluster[matrix_rows]
+ordered_index <- order(sample_clusters)
+
+ordered_dist <- raw_dist[ordered_index, ordered_index]
+
+image(
+  1:nrow(ordered_dist),
+  1:ncol(ordered_dist),
+  ordered_dist,
+  col = hcl.colors(100, "YlOrRd", rev = TRUE),
+  axes = FALSE,
+  xlab = "Observations ordered by cluster",
+  ylab = "Observations ordered by cluster",
+  main = "Dissimilarity matrix — ordered by Mclust cluster"
+)
+
+axis(1, at = pretty(seq_len(nrow(ordered_dist))))
+axis(2, at = pretty(seq_len(nrow(ordered_dist))))
+box()
+
+# Add approximate cluster boundaries.
+ordered_labels <- as.character(sample_clusters[ordered_index])
+changes <- which(ordered_labels[-1] != ordered_labels[-length(ordered_labels)])
+if (length(changes) > 0) {
+  abline(v = changes + 0.5, h = changes + 0.5, lty = 2)
+}
+```
+
+# 11. Cluster quality — silhouette
+
+Silhouette width provides an additional, independent check of separation.
+
+```{r silhouette}
+full_dist <- dist(cluster_scaled)
+
+sil <- silhouette(
+  as.integer(df$Cluster),
+  full_dist
+)
+
+average_silhouette <- mean(sil[, "sil_width"])
+
+cat(
+  "Average silhouette width:",
+  round(average_silhouette, 4),
+  "\n"
+)
+
+plot(
+  sil,
+  border = NA,
+  main = "Silhouette plot for Mclust cluster assignments"
+)
+```
+
+```{r silhouette-interpretation}
+if (average_silhouette >= 0.50) {
+  cat("Interpretation: reasonably strong separation.\n")
+} else if (average_silhouette >= 0.25) {
+  cat("Interpretation: weak-to-moderate separation; clusters overlap.\n")
+} else {
+  cat("Interpretation: weak separation; cluster assignments should be interpreted cautiously.\n")
+}
+```
+
+# 12. Cluster profiling
+
+## 12.1 Numeric profile
+
+```{r profile}
+profile <- df %>%
+  group_by(Cluster) %>%
+  summarise(
+    across(
+      all_of(numeric_features),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+print(profile)
+```
+
+## 12.2 Standardised cluster fingerprint
+
+```{r profile-fingerprint, fig.width=9, fig.height=6}
+profile_long <- profile %>%
+  pivot_longer(
+    cols = -Cluster,
+    names_to = "Feature",
+    values_to = "Mean"
+  )
+
+profile_long$Z_Mean <- as.numeric(
+  scale(profile_long$Mean)
+)
+
+ggplot(
+  profile_long,
+  aes(x = Feature, y = Z_Mean, fill = Cluster)
+) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Cluster profile fingerprint",
+    subtitle = "Standardised cluster means",
+    x = NULL,
+    y = "Standardised mean",
+    fill = "Cluster"
+  )
+```
+
+## 12.3 Lifestyle composition
+
+Lifestyle was deliberately excluded from the Mclust input. It is now used to
+help describe what each cluster looks like.
+
+```{r lifestyle}
+lifestyle_table <- table(df$Cluster, df$Lifestyle)
+print(lifestyle_table)
+
+lifestyle_df <- as.data.frame(lifestyle_table)
+names(lifestyle_df) <- c("Cluster", "Lifestyle", "Count")
+
+ggplot(
+  lifestyle_df,
+  aes(x = Cluster, y = Count, fill = Lifestyle)
+) +
+  geom_col(position = "fill") +
+  theme_minimal(base_size = 12) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Lifestyle composition within each cluster",
+    x = "Cluster",
+    y = "Proportion",
+    fill = "Lifestyle"
+  )
+```
+
+# 13. Cluster uncertainty
+
+Mclust provides a posterior probability for the assigned cluster. Low
+uncertainty means the observation has a clear model-based assignment.
+
+```{r uncertainty}
+uncertainty_df <- data.frame(
+  Cluster = df$Cluster,
+  Uncertainty = mclust_model$uncertainty
+)
+
+cat(
+  "Mean classification uncertainty:",
+  round(mean(uncertainty_df$Uncertainty), 4),
+  "\n"
+)
+
+ggplot(uncertainty_df, aes(x = Cluster, y = Uncertainty)) +
+  geom_boxplot() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Mclust classification uncertainty",
+    x = "Cluster",
+    y = "Uncertainty"
+  )
+```
+
+# 14. Overall evaluation summary
+
+```{r evaluation-summary}
+cat("========================================\n")
+cat("CLUSTERING EVALUATION SUMMARY\n")
+cat("========================================\n")
+cat("Observations: ", nrow(df), "\n", sep = "")
+cat("Variables used by Mclust: ", length(numeric_features), "\n", sep = "")
+cat("BIC-selected G: ", optimal_G, "\n", sep = "")
+cat("Covariance model: ", mclust_model$modelName, "\n", sep = "")
+cat("Continuous-only Hopkins: ", round(hopkins_value, 4), "\n", sep = "")
+cat("Average silhouette: ", round(average_silhouette, 4), "\n", sep = "")
+cat("Mean uncertainty: ",
+    round(mean(mclust_model$uncertainty), 4), "\n", sep = "")
+cat("========================================\n")
+```
+
+**Important interpretation:** a high Hopkins statistic alone does not establish
+that the final clusters are useful. The final judgement should consider
+**BIC, silhouette width, the dissimilarity matrix, cluster sizes, uncertainty,
+and the substantive cluster profiles together**.
+
+# 15. Save the final clustered dataset
+
+This output is used by the classification analysis.
+
+```{r save-output}
+output_file <- "crc_data_with_clusters.csv"
+
+write.csv(
+  df,
+  output_file,
+  row.names = FALSE
+)
+
+cat(
+  "Saved clustered dataset to:",
+  normalizePath(output_file, winslash = "/", mustWork = FALSE),
+  "\n"
+)
+```

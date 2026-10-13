@@ -1,0 +1,741 @@
+---
+title: "Cancer Risk Classification — With vs Without Cluster Membership"
+subtitle: "CRISP-DM: Classification Modelling, Cross-Validation & Hold-Out Evaluation"
+author: "Jessica Ngobeni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# 1. Project overview
+
+This analysis tests whether the **cluster membership produced by the
+unsupervised clustering stage adds predictive value** for CRC risk.
+
+Two models are compared:
+
+1. Logistic Regression — without cluster membership
+2. Logistic Regression — with cluster membership
+3. Random Forest — without cluster membership
+4. Random Forest — with cluster membership
+
+A **70/30 stratified train/test split** is created once. The test set is kept
+untouched until final evaluation. Model selection is performed using repeated
+5-fold cross-validation on the training data.
+
+A further methodological improvement is that the clustering model used to
+create the cluster feature is fitted on the **training set only** and then
+applied to the held-out test set. This avoids allowing the test observations to
+influence the cluster feature.
+
+# 2. Load packages
+
+```{r libraries}
+required_packages <- c(
+  "caret",
+  "mclust",
+  "randomForest",
+  "pROC",
+  "ggplot2",
+  "dplyr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Missing package(s): ", paste(missing_packages, collapse = ", "),
+      ". Install them once with:\ninstall.packages(c(",
+      paste0('"', missing_packages, '"', collapse = ", "),
+      "))"
+    )
+  )
+}
+
+library(caret)
+library(mclust)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+```
+
+# 3. Load the clustered dataset
+
+```{r load-data}
+data_file <- "crc_data_with_clusters.csv"
+
+if (!file.exists(data_file)) {
+  stop(
+    paste0(
+      "Cannot find '", data_file, "'. ",
+      "Run the clustering Rmd first and keep the resulting CSV ",
+      "in the same folder as this Rmd."
+    )
+  )
+}
+
+df <- read.csv(data_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+cat("Rows:", nrow(df), "\n")
+cat("Columns:", ncol(df), "\n")
+head(df)
+```
+
+# 4. Prepare the target and predictors
+
+## 4.1 Check the required columns
+
+```{r check-columns}
+required_columns <- c(
+  "Age", "Gender", "BMI", "Lifestyle", "Ethnicity",
+  "Family_History_CRC", "Pre-existing Conditions",
+  "Carbohydrates (g)", "Proteins (g)", "Fats (g)",
+  "Vitamin A (IU)", "Vitamin C (mg)", "Iron (mg)", "CRC_Risk"
+)
+
+missing_required <- setdiff(required_columns, names(df))
+
+if (length(missing_required) > 0) {
+  stop(
+    paste("Missing required columns:",
+          paste(missing_required, collapse = ", "))
+  )
+}
+
+cat("All required columns are present.\n")
+```
+
+## 4.2 Clean variable types
+
+```{r clean-types}
+numeric_predictors <- c(
+  "Age", "BMI",
+  "Carbohydrates (g)", "Proteins (g)", "Fats (g)",
+  "Vitamin A (IU)", "Vitamin C (mg)", "Iron (mg)"
+)
+
+for (v in numeric_predictors) {
+  df[[v]] <- as.numeric(df[[v]])
+}
+
+df$CRC_Risk <- factor(
+  df$CRC_Risk,
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+if (anyNA(df$CRC_Risk)) {
+  stop("CRC_Risk contains missing or unexpected values after conversion.")
+}
+
+cat("Outcome counts:\n")
+print(table(df$CRC_Risk))
+```
+
+# 5. Train/test split
+
+The same observations are used in every model comparison.
+
+```{r split}
+set.seed(42)
+
+train_idx <- createDataPartition(
+  df$CRC_Risk,
+  p = 0.70,
+  list = FALSE
+)
+
+train_raw <- df[train_idx, , drop = FALSE]
+test_raw  <- df[-train_idx, , drop = FALSE]
+
+cat("Training observations:", nrow(train_raw), "\n")
+cat("Test observations:", nrow(test_raw), "\n")
+```
+
+# 6. Build a leakage-safe cluster feature
+
+The original clustering output is useful for integration, but for a rigorous
+predictive evaluation the cluster solution should not be learned using the
+test observations.
+
+Here, Mclust is fitted using **training observations only** and the resulting
+cluster model is used to classify the test observations.
+
+```{r train-cluster-model}
+cluster_features <- c(
+  "BMI",
+  "Carbohydrates (g)",
+  "Proteins (g)",
+  "Fats (g)",
+  "Vitamin A (IU)",
+  "Vitamin C (mg)",
+  "Iron (mg)"
+)
+
+for (v in cluster_features) {
+  if (anyNA(train_raw[[v]])) {
+    train_raw[[v]][is.na(train_raw[[v]])] <-
+      median(train_raw[[v]], na.rm = TRUE)
+  }
+
+  if (anyNA(test_raw[[v]])) {
+    # Use training-set medians for test data: no test-set information
+    # is used to estimate preprocessing values.
+    test_raw[[v]][is.na(test_raw[[v]])] <-
+      median(train_raw[[v]], na.rm = TRUE)
+  }
+}
+
+cluster_train_scaled <- scale(
+  train_raw[, cluster_features, drop = FALSE]
+)
+
+cluster_center <- attr(cluster_train_scaled, "scaled:center")
+cluster_scale  <- attr(cluster_train_scaled, "scaled:scale")
+
+cluster_test_scaled <- scale(
+  test_raw[, cluster_features, drop = FALSE],
+  center = cluster_center,
+  scale = cluster_scale
+)
+
+# Mclust internally evaluates mclustBIC(), so the mclust package
+# is attached explicitly before fitting the model.
+if (!exists("mclustBIC", mode = "function")) {
+  stop(
+    "The mclust package is installed but mclustBIC() is unavailable. ",
+    "Please restart R and run: install.packages("mclust")"
+  )
+}
+
+set.seed(42)
+
+cluster_model <- Mclust(
+  cluster_train_scaled,
+  G = 2:8
+)
+
+train_cluster <- cluster_model$classification
+
+test_cluster_prediction <- predict(
+  cluster_model,
+  newdata = cluster_test_scaled
+)
+
+test_cluster <- test_cluster_prediction$classification
+
+cat("Training-set BIC-selected G:", cluster_model$G, "\n")
+cat("Covariance model:", cluster_model$modelName, "\n")
+```
+
+# 7. Prepare model matrices
+
+The categorical predictors are converted to indicator variables using
+`model.matrix()`. This avoids dependence on `fastDummies` and makes the
+workflow easier to reproduce.
+
+```{r model-matrices}
+predictor_names <- c(
+  "Age", "Gender", "BMI", "Lifestyle", "Ethnicity",
+  "Family_History_CRC", "Pre-existing Conditions",
+  "Carbohydrates (g)", "Proteins (g)", "Fats (g)",
+  "Vitamin A (IU)", "Vitamin C (mg)", "Iron (mg)"
+)
+
+train_predictors <- train_raw[, predictor_names, drop = FALSE]
+test_predictors  <- test_raw[, predictor_names, drop = FALSE]
+
+# Impute categorical variables using training-set mode.
+categorical_predictors <- c(
+  "Gender", "Lifestyle", "Ethnicity",
+  "Family_History_CRC", "Pre-existing Conditions"
+)
+
+mode_value <- function(x) {
+  tab <- table(x, useNA = "no")
+  names(tab)[which.max(tab)]
+}
+
+for (v in categorical_predictors) {
+  if (anyNA(train_predictors[[v]])) {
+    train_predictors[[v]][is.na(train_predictors[[v]])] <- mode_value(train_predictors[[v]])
+  }
+
+  if (anyNA(test_predictors[[v]])) {
+    test_predictors[[v]][is.na(test_predictors[[v]])] <- mode_value(train_predictors[[v]])
+  }
+
+  train_predictors[[v]] <- factor(train_predictors[[v]])
+  test_predictors[[v]] <- factor(
+    test_predictors[[v]],
+    levels = levels(train_predictors[[v]])
+  )
+
+  # Any genuinely new test category becomes NA; replace it with the training mode.
+  if (anyNA(test_predictors[[v]])) {
+    test_predictors[[v]][is.na(test_predictors[[v]])] <-
+      levels(train_predictors[[v]])[1]
+  }
+}
+
+# Numeric imputation uses training-set medians.
+for (v in numeric_predictors) {
+  if (anyNA(train_predictors[[v]])) {
+    train_predictors[[v]][is.na(train_predictors[[v]])] <-
+      median(train_predictors[[v]], na.rm = TRUE)
+  }
+
+  if (anyNA(test_predictors[[v]])) {
+    test_predictors[[v]][is.na(test_predictors[[v]])] <-
+      median(train_predictors[[v]], na.rm = TRUE)
+  }
+}
+
+# Create matching dummy-variable columns.
+x_train_base <- model.matrix(
+  ~ . - 1,
+  data = train_predictors
+)
+
+x_test_base <- model.matrix(
+  ~ . - 1,
+  data = test_predictors
+)
+
+# Align test columns exactly with training columns.
+missing_test_columns <- setdiff(colnames(x_train_base), colnames(x_test_base))
+
+if (length(missing_test_columns) > 0) {
+  for (v in missing_test_columns) {
+    x_test_base <- cbind(x_test_base, setNames(data.frame(rep(0, nrow(x_test_base))), v))
+  }
+}
+
+extra_test_columns <- setdiff(colnames(x_test_base), colnames(x_train_base))
+
+if (length(extra_test_columns) > 0) {
+  x_test_base <- x_test_base[, setdiff(colnames(x_test_base), extra_test_columns), drop = FALSE]
+}
+
+x_test_base <- x_test_base[, colnames(x_train_base), drop = FALSE]
+
+y_train <- train_raw$CRC_Risk
+y_test  <- test_raw$CRC_Risk
+```
+
+# 8. Add cluster membership
+
+The cluster feature is appended to a copy of the model matrix.
+
+```{r add-cluster}
+x_train_with_cluster <- cbind(
+  x_train_base,
+  Cluster = factor(train_cluster)
+)
+
+x_test_with_cluster <- cbind(
+  x_test_base,
+  Cluster = factor(
+    test_cluster,
+    levels = levels(factor(train_cluster))
+  )
+)
+
+# model.matrix is used again so Cluster is represented consistently.
+cluster_train_dummy <- model.matrix(~ Cluster - 1, data = data.frame(Cluster = factor(train_cluster)))
+cluster_test_dummy  <- model.matrix(
+  ~ Cluster - 1,
+  data = data.frame(
+    Cluster = factor(
+      test_cluster,
+      levels = levels(factor(train_cluster))
+    )
+  )
+)
+
+x_train_with_cluster <- cbind(
+  x_train_base,
+  cluster_train_dummy
+)
+
+x_test_with_cluster <- cbind(
+  x_test_base,
+  cluster_test_dummy
+)
+
+colnames(x_train_with_cluster) <- make.names(colnames(x_train_with_cluster))
+colnames(x_test_with_cluster)  <- make.names(colnames(x_test_with_cluster))
+```
+
+# 9. Repeated cross-validation
+
+All model tuning occurs inside the training set.
+
+```{r cv-control}
+cv_control <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+```
+
+# 10. Train four models
+
+## 10.1 Logistic regression — without cluster
+
+```{r logit-no-cluster}
+set.seed(42)
+
+logit_no_cluster <- train(
+  x = x_train_base,
+  y = y_train,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+```
+
+## 10.2 Logistic regression — with cluster
+
+```{r logit-with-cluster}
+set.seed(42)
+
+logit_with_cluster <- train(
+  x = x_train_with_cluster,
+  y = y_train,
+  method = "glm",
+  family = binomial(),
+  trControl = cv_control,
+  metric = "ROC"
+)
+```
+
+## 10.3 Random Forest — without cluster
+
+```{r rf-no-cluster}
+set.seed(42)
+
+rf_no_cluster <- train(
+  x = x_train_base,
+  y = y_train,
+  method = "rf",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 3,
+  importance = TRUE
+)
+```
+
+## 10.4 Random Forest — with cluster
+
+```{r rf-with-cluster}
+set.seed(42)
+
+rf_with_cluster <- train(
+  x = x_train_with_cluster,
+  y = y_train,
+  method = "rf",
+  trControl = cv_control,
+  metric = "ROC",
+  tuneLength = 3,
+  importance = TRUE
+)
+```
+
+# 11. Cross-validated performance
+
+```{r cv-results}
+cv_results <- resamples(
+  list(
+    "Logistic — without cluster" = logit_no_cluster,
+    "Logistic — with cluster" = logit_with_cluster,
+    "Random Forest — without cluster" = rf_no_cluster,
+    "Random Forest — with cluster" = rf_with_cluster
+  )
+)
+
+print(summary(cv_results))
+```
+
+```{r cv-boxplot}
+bwplot(
+  cv_results,
+  metric = "ROC",
+  main = "Repeated 5-fold cross-validated ROC-AUC"
+)
+```
+
+# 12. Final hold-out evaluation
+
+The test set has not been used for model selection.
+
+```{r holdout-predictions}
+prob_logit_no <- predict(
+  logit_no_cluster,
+  newdata = x_test_base,
+  type = "prob"
+)[, "Yes"]
+
+prob_logit_with <- predict(
+  logit_with_cluster,
+  newdata = x_test_with_cluster,
+  type = "prob"
+)[, "Yes"]
+
+prob_rf_no <- predict(
+  rf_no_cluster,
+  newdata = x_test_base,
+  type = "prob"
+)[, "Yes"]
+
+prob_rf_with <- predict(
+  rf_with_cluster,
+  newdata = x_test_with_cluster,
+  type = "prob"
+)[, "Yes"]
+
+roc_logit_no <- roc(y_test, prob_logit_no, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+roc_logit_with <- roc(y_test, prob_logit_with, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+roc_rf_no <- roc(y_test, prob_rf_no, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+roc_rf_with <- roc(y_test, prob_rf_with, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+```
+
+# 13. Model comparison table
+
+```{r comparison-table}
+results <- data.frame(
+  Model = c(
+    "Logistic Regression",
+    "Logistic Regression",
+    "Random Forest",
+    "Random Forest"
+  ),
+  Cluster_Feature = c(
+    "Without",
+    "With",
+    "Without",
+    "With"
+  ),
+  CV_ROC_Mean = c(
+    mean(logit_no_cluster$resample$ROC),
+    mean(logit_with_cluster$resample$ROC),
+    mean(rf_no_cluster$resample$ROC),
+    mean(rf_with_cluster$resample$ROC)
+  ),
+  Holdout_AUC_ROC = c(
+    as.numeric(auc(roc_logit_no)),
+    as.numeric(auc(roc_logit_with)),
+    as.numeric(auc(roc_rf_no)),
+    as.numeric(auc(roc_rf_with))
+  )
+)
+
+results$AUC_Change_vs_No_Cluster <- c(
+  NA,
+  results$Holdout_AUC_ROC[2] - results$Holdout_AUC_ROC[1],
+  NA,
+  results$Holdout_AUC_ROC[4] - results$Holdout_AUC_ROC[3]
+)
+
+results$Meets_0.75_Target <- results$Holdout_AUC_ROC >= 0.75
+
+print(results)
+```
+
+# 14. ROC curves
+
+```{r roc-curves}
+plot(
+  roc_logit_no,
+  main = "Hold-out ROC curves",
+  lwd = 2
+)
+
+lines(roc_logit_with, lwd = 2, lty = 2)
+lines(roc_rf_no, lwd = 2)
+lines(roc_rf_with, lwd = 2, lty = 2)
+
+legend(
+  "bottomright",
+  legend = c(
+    "Logistic — without cluster",
+    "Logistic — with cluster",
+    "Random Forest — without cluster",
+    "Random Forest — with cluster"
+  ),
+  lty = c(1, 2, 1, 2),
+  lwd = 2,
+  cex = 0.75
+)
+
+abline(a = 0, b = 1, lty = 3)
+```
+
+# 15. Does clustering improve prediction?
+
+```{r cluster-value}
+logit_change <- results$AUC_Change_vs_No_Cluster[2]
+rf_change <- results$AUC_Change_vs_No_Cluster[4]
+
+cat("Logistic Regression AUC change from adding cluster:",
+    round(logit_change, 4), "\n")
+
+cat("Random Forest AUC change from adding cluster:",
+    round(rf_change, 4), "\n")
+
+if (logit_change > 0) {
+  cat("Cluster membership improves hold-out AUC for Logistic Regression.\n")
+} else if (logit_change < 0) {
+  cat("Cluster membership reduces hold-out AUC for Logistic Regression.\n")
+} else {
+  cat("Cluster membership produces no change in hold-out AUC for Logistic Regression.\n")
+}
+
+if (rf_change > 0) {
+  cat("Cluster membership improves hold-out AUC for Random Forest.\n")
+} else if (rf_change < 0) {
+  cat("Cluster membership reduces hold-out AUC for Random Forest.\n")
+} else {
+  cat("Cluster membership produces no change in hold-out AUC for Random Forest.\n")
+}
+```
+
+# 16. Confusion matrix for the best model
+
+The best model is selected automatically using the **hold-out AUC**, then its
+classification performance is displayed.
+
+```{r best-model}
+best_row <- which.max(results$Holdout_AUC_ROC)
+
+best_name <- paste(
+  results$Model[best_row],
+  results$Cluster_Feature[best_row]
+)
+
+cat("Best model:", best_name, "\n")
+cat("Hold-out AUC:", round(results$Holdout_AUC_ROC[best_row], 4), "\n")
+
+best_model <- list(
+  logit_no = logit_no_cluster,
+  logit_with = logit_with_cluster,
+  rf_no = rf_no_cluster,
+  rf_with = rf_with_cluster
+)[[
+  c(
+    "logit_no",
+    "logit_with",
+    "rf_no",
+    "rf_with"
+  )[best_row]
+]]
+
+best_newdata <- list(
+  logit_no = x_test_base,
+  logit_with = x_test_with_cluster,
+  rf_no = x_test_base,
+  rf_with = x_test_with_cluster
+)[[
+  c(
+    "logit_no",
+    "logit_with",
+    "rf_no",
+    "rf_with"
+  )[best_row]
+]]
+
+best_class <- predict(best_model, newdata = best_newdata)
+
+cm <- confusionMatrix(
+  best_class,
+  y_test,
+  positive = "Yes"
+)
+
+print(cm)
+```
+
+```{r confusion-plot}
+cm_df <- as.data.frame(cm$table)
+
+ggplot(
+  cm_df,
+  aes(x = Reference, y = Prediction, fill = Freq)
+) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 6) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste("Confusion matrix —", best_name),
+    x = "Actual class",
+    y = "Predicted class",
+    fill = "Count"
+  )
+```
+
+# 17. Random Forest variable importance
+
+The Random Forest with cluster membership is inspected for interpretability.
+
+```{r importance}
+plot(
+  varImp(rf_with_cluster),
+  top = 15,
+  main = "Top Random Forest predictors — with cluster membership"
+)
+```
+
+# 18. Final report summary
+
+```{r final-summary}
+best_auc <- results$Holdout_AUC_ROC[best_row]
+
+cat("========================================\n")
+cat("CLASSIFICATION SUMMARY\n")
+cat("========================================\n")
+cat("Training observations: ", nrow(train_raw), "\n", sep = "")
+cat("Test observations: ", nrow(test_raw), "\n", sep = "")
+cat("Cluster model G: ", cluster_model$G, "\n", sep = "")
+cat("Best model: ", best_name, "\n", sep = "")
+cat("Best hold-out AUC-ROC: ", round(best_auc, 4), "\n", sep = "")
+cat("Meets AUC >= 0.75 target: ",
+    ifelse(best_auc >= 0.75, "YES", "NO"), "\n", sep = "")
+cat("========================================\n")
+```
+
+# 19. Save results
+
+```{r save-results}
+write.csv(
+  results,
+  "classification_results.csv",
+  row.names = FALSE
+)
+
+cat("Saved classification results to classification_results.csv\n")
+```
